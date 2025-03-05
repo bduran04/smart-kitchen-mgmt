@@ -6,7 +6,7 @@ ordersRouter.prefix = "orders";
 
 ordersRouter.get("/:id", (res: Response) => {
     try {
-        // This is a placeholder for the actual order retrieval logic
+    // This is a placeholder for the actual order retrieval logic
     // const orderId = req.params.id;
     // const order = await prisma.order.findUnique({ where: { id: orderId } });
     const sampleOrder = {
