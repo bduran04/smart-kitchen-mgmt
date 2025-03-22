@@ -15,6 +15,7 @@ interface InventoryItem {
   threshold: number;
   shelflife: number;
   bulkOrderQuantity: number;
+
 }
 
 interface BackendStock {
@@ -47,6 +48,15 @@ interface IngredientType {
   bulkOrderQuantity: number;
 }
 
+interface IngredientType {
+  name: string;
+  ingredientid: number;
+  current: number;
+  price: number;
+  shelflife: number;
+  bulkOrderQuantity: number;
+}
+
 export const IngredientInventoryContainer: React.FC = () => {
   const [searchTerm, setSearchTerm] = useState<string>('');
   const [inventoryData, setInventoryData] = useState<InventoryItem[]>([]);
@@ -66,7 +76,6 @@ export const IngredientInventoryContainer: React.FC = () => {
   const handleConfirmOrder = async () => {
     if (!selectedIngredient) return;
     
-    // Use the updateStock function
     const res = await updateStock({
       ingredientId: selectedIngredient.ingredientid,
       current: selectedIngredient.current,
@@ -80,22 +89,25 @@ export const IngredientInventoryContainer: React.FC = () => {
       modalRef.current?.close();
       // Clear selected ingredient after order
       setSelectedIngredient(null);
-    };
+
+      if (res.data) {
+        const updatedData = transformStockData(res.data as BackendStock);
+        setInventoryData(updatedData);
+      }
+    }
   };
+
 
 
   // Sample data for fallback/development
   const getSampleInventoryData = (): InventoryItem[] => [
     { ingredientid: 1, name: 'Regular Bun', price: 0.50, status: 'In Stock', current: 100, capacity: 250, threshold: 125, category: 'Buns', shelflife: 7, bulkOrderQuantity: 75 },
     { ingredientid: 2, name: 'No Bun', price: 0.00, status: 'Always Available', current: 0, capacity: 0, threshold: 0, category: 'Buns', shelflife: 6, bulkOrderQuantity: 75 },
-    
     { ingredientid: 3, name: 'Crispy Patty', price: 1.20, status: 'In Stock', current: 75, capacity: 200, threshold: 100, category: 'Patties', shelflife: 5, bulkOrderQuantity: 75 },
     { ingredientid: 4, name: 'Spicy Patty', price: 1.30, status: 'Out of Stock', current: 50, capacity: 200, threshold: 100, category: 'Patties', shelflife: 5, bulkOrderQuantity: 75 },
     { ingredientid: 5, name: 'Grilled Patty', price: 1.40, status: 'In Stock', current: 60, capacity: 200, threshold: 100, category: 'Patties', shelflife: 5, bulkOrderQuantity: 75 },
-    
     { ingredientid: 6, name: 'Single Serving Nuggets', price: 0.80, status: 'In Stock', current: 90, capacity: 300, threshold: 150, category: 'Chicken', shelflife: 3, bulkOrderQuantity: 75 },
     { ingredientid: 7, name: 'Double Serving Nuggets', price: 1.50, status: 'Out of Stock', current: 70, capacity: 300, threshold: 150, category: 'Chicken', shelflife: 6, bulkOrderQuantity: 75 },
-    
     { ingredientid: 15, name: 'Lettuce', price: 0.25, status: 'In Stock', current: 200, capacity: 500, threshold: 250, category: 'Produce', shelflife: 5, bulkOrderQuantity: 75 },
     { ingredientid: 16, name: 'Tomato', price: 0.50, status: 'Low Stock', current: 150, capacity: 400, threshold: 200, category: 'Produce', shelflife: 5, bulkOrderQuantity: 75 },
     { ingredientid: 11, name: 'Cheese Slice', price: 0.30, status: 'In Stock', current: 80, capacity: 200, threshold: 100, category: 'Cheese', shelflife: 7, bulkOrderQuantity: 75 },
@@ -117,7 +129,7 @@ export const IngredientInventoryContainer: React.FC = () => {
       
       // Calculate total capacity (arbitrary - we'll use 5x threshold)
       const capacity = ingredient.thresholdquantity * 5;
-      
+
       // Determine status based on quantity and threshold
       let status = 'In Stock';
       if (ingredient.ingredientname === "No Bun") {
@@ -142,7 +154,7 @@ export const IngredientInventoryContainer: React.FC = () => {
         category: ingredient.category,
         threshold: ingredient.thresholdquantity,
         shelflife: ingredient.shelflife,
-        bulkOrderQuantity: ingredient.bulkOrderQuantity,
+        bulkOrderQuantity: ingredient.bulkOrderQuantity
       };
     });
   };
@@ -275,6 +287,7 @@ export const IngredientInventoryContainer: React.FC = () => {
                   <th className="py-2 px-3 text-left text-blue-500">Threshold</th>
                   <th className="py-2 px-3 text-left text-blue-500">Category</th>
                   <th className="py-2 px-3 text-left text-blue-500"></th>
+                  <th className="py-2 px-3 text-left text-blue-500"></th>
                 </tr>
               </thead>
               <tbody>
@@ -300,10 +313,10 @@ export const IngredientInventoryContainer: React.FC = () => {
                       </td>
                       <td className="py-2 px-3">
                         <button className="btn btn-xs sm:btn-sm md:btn-md lg:btn-lg xl:btn-xl bg-blue-600 text-white rounded-lg font-semibold hover:bg-blue-600 transition-colors border-none" onClick={()=>handleOrderClick(item)}>Order</button>
-                        <dialog id={`order-modal-${index}`} ref={modalRef} className="modal">
-                          <div className="modal-box">
-                            <h3 className="font-bold text-lg">Please Confirm That You Would Like to Place This Order</h3>
-                            <p className="py-4">Confirming will place an order with your supplier</p>
+                        <dialog key={item.ingredientid} ref={modalRef} className="modal">
+                          <div className="modal-box bg-white p-4 rounded-lg shadow-lg">
+                            <h3 className="font-bold text-black text-lg">Please Confirm That You Would Like to Place This Order</h3>
+                            <p className="text-black py-4">Confirming will place an order with your supplier</p>
                             <div className="modal-action flex justify-end gap-4">
                               <form method="dialog">
                                 {/* if there is a button in form, it will close the modal */}
@@ -331,6 +344,7 @@ export const IngredientInventoryContainer: React.FC = () => {
     </div>
   );
 };
+
 
 
 export default IngredientInventoryContainer;
