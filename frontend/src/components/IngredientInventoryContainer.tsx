@@ -101,9 +101,13 @@ export const IngredientInventoryContainer: React.FC = () => {
 
 
         if (res.data) {
+          if (res.data === null) {
+          console.log("Order will be shipped from Supplier");
+        }else {
           const updatedData = transformStockData(res.data as BackendStock);
           setInventoryData(updatedData);
         }
+      }
       } else {
         // Show error alert
         setAlertType('error');
