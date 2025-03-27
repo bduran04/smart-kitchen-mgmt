@@ -11,7 +11,9 @@ export default function SideNavBar() {
   const updateCurrentSelection =(passedSelection: string)=>{    
     setCurrentSelection(passedSelection);
     switch(passedSelection){      
-      case "Home": {router.push("/");break;}
+      case "Home": break;
+      case "Portal":{router.push("/select-portal"); break;}
+      case "Dashboard":{router.push("/dashboard"); break;}
       case "Menu Manager": {router.push("/menuManagement");break;}
       case "Order Tracking": {router.push("/orderTracking");break;}
       case "Inventory Tracker": {router.push("/inventoryTracker");break;}
@@ -46,6 +48,21 @@ export default function SideNavBar() {
               />
             }
           )}
+          {isCurrentSelection("Home") &&
+            <span className="fixed top-[60px] outline w-[100px] left-[100px] grid grid-cols-1 grid-rows-2">
+              <SelectableButton 
+                buttonClassName={buttonStyle} 
+                selected={isCurrentSelection("Dashboard")} 
+                setCurrentSelection={updateCurrentSelection} 
+                text={"Dashboard"}
+              />            
+              <SelectableButton 
+                buttonClassName={buttonStyle} 
+                selected={isCurrentSelection("Portal")} 
+                setCurrentSelection={updateCurrentSelection} 
+                text={"Portal"}
+              />            
+            </span>}
         </div>}
       </>
       
