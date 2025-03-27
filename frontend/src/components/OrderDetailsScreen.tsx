@@ -1,6 +1,7 @@
 import React from "react";
 import styles from "../styles/OrderDetailsScreen.module.css";
 import { Order } from "./OrderReceiptManager";
+import scrollBarToggle from "./scrollBarToggle";
 
 export interface OrderDetails{
   order: Order | null,
@@ -10,14 +11,19 @@ export interface OrderDetails{
 export default function OrderDetailsScreen(orderDetails: OrderDetails) {
   const oDetails = orderDetails.order  
   const disableModal =()=>{
+    scrollBarToggle(true)
     orderDetails.updateOrderDetailsScreen(null)
   }
+  scrollBarToggle(false)
   const orderTotal = oDetails?.orderitems.reduce((acc, curr)=>{ return acc + parseFloat(curr.menuitems.price.toString())},0)
   const tax = parseFloat(((Math.random() * 10) + 1).toFixed(2));
   const finalPrice = orderTotal? (tax + orderTotal).toFixed(2): 0;
+  const orderTimeStamp = new Date(oDetails?.ordertimestamp || "").toLocaleString("en-US", { timeZone: "UTC" })
   return (
     <>
-      <span className={styles["order-details-container-bg"]} onClick={disableModal}></span>
+      <span className={styles["order-details-container-bg"]} onClick={()=>{        
+        disableModal()
+      }}></span>
       <dialog className={styles["order-details-container"]} 
       onLoadStart={(e)=> e.currentTarget.focus()}
       onKeyDown={(e)=> {
@@ -28,12 +34,12 @@ export default function OrderDetailsScreen(orderDetails: OrderDetails) {
         <button className={styles["exit-button"]}
         onClick={disableModal}
         >Exit</button>
-        <span className="flex gap-[1rem] mt-[40px] justify-center">        
+        <span className= {styles["info-panels-container"]}>        
           <span className={styles["full-order-details-container"]}>
             <span className={styles["order-details-header"]}>
-              <p>Restaurant Name</p>
+              <p>Chicken Queen</p>
               <p>Order #{oDetails?.orderid}</p>
-              <p>Order Date</p>
+              <p>Order Date: {orderTimeStamp.split(",")[0]}</p>
             </span>
             <span className={styles["items-list-container"]}>
               {oDetails?.orderitems && oDetails?.orderitems.map((elem, index)=>{
@@ -52,8 +58,13 @@ export default function OrderDetailsScreen(orderDetails: OrderDetails) {
             </span>
             <span className={styles["message-and-payment-method-container"]}>
               <p>Payment Method:</p>
-              <p>Credit Card(**** 2394)</p>
-              <p>{`Thank you for choosing Cluckin' Good Chicken! Have a cluckin' great day! 🐔`}</p>
+              <select name="payment-method" id={styles["payment-method"]}>
+                <option className={styles["option-selection"]} value="credit-card">Credit Card (**** 2394)</option>
+                <option className={styles["option-selection"]} value="Debit-debit">Debit Card (**** 4596)</option>
+                <option className={styles["option-selection"]} value="cash">Cash</option>
+                <option className={styles["option-selection"]} value="payPal">PayPal</option>
+              </select>
+              <p>{`Thank you for choosing Chicken Queen Chicken! Have a great day! 👑🐔`}</p>
             </span>
           </span>
           <span className={styles["modify-order-container"]}>
@@ -70,7 +81,7 @@ export default function OrderDetailsScreen(orderDetails: OrderDetails) {
                 Mark Refunded / Dissatisfied
               </button>
             </span>
-            <button className="btn w-[max-content] bg-[--foreground] border-none text-white"
+            <button className={styles["print-receipt-button"]}
               onClick={()=> window.print()}
             >
               Print Receipt
