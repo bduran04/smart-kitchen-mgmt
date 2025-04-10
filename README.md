@@ -26,7 +26,9 @@ Digital ticket system that tracks orders from POS to kitchen
 Real-time inventory management that automatically deducts ingredients as orders are completed  
 Predictive prep recommendations based on historical order patterns (e.g., "Prep 3 extra batches of fries between 11:30-12:30")  
 Menu engineering dashboard showing profitability per dish, waste metrics, and ingredient cost tracking  
-Integration with supplier APIs for automatic reordering when ingredients hit threshold levels  
+Integration with supplier APIs for automatic reordering when ingredients hit threshold levels
+
+Deployed Frontend Site: [Deployed Frontend Site](https://legendary-fox-495ba2.netlify.app/)
 
 ### Project Overview
 
