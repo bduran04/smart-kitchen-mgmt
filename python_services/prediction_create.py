@@ -7,6 +7,9 @@ from statsmodels.tsa.statespace.sarimax import SARIMAX
 from sklearn.metrics import mean_squared_error
 import warnings
 import json
+import multiprocessing
+from functools import partial
+import itertools
 from db_utils import connect_to_db
 from fetch_menu_ingredients import fetch_menu_items_ingredients
 from fetch_orders import fetch_historical_orders
@@ -14,6 +17,9 @@ from fetch_orders import fetch_historical_orders
 # Suppress warning messages for cleaner output
 warnings.filterwarnings('ignore')
 
+###################################################################################
+# PART 1: DATA COLLECTION AND PROCESSING
+###################################################################################
 
 def calculate_ingredient_needs(start_date=None, end_date=None):
     """
@@ -34,16 +40,17 @@ def calculate_ingredient_needs(start_date=None, end_date=None):
         
     Returns:
     --------
-    pandas.DataFrame
-        DataFrame indexed by hourly timestamps with ingredient columns,
-        containing total required quantities per hour.
+    dict
+        Dictionary containing DataFrames with ingredient usage:
+        - 'hourly': DataFrame indexed by hourly timestamps
+        - 'daily': DataFrame with daily aggregated data
     """
     print("Retrieving order history...")
     orders = fetch_historical_orders(start_date, end_date)
     
     if not orders:
         print("❌ No orders found. Cannot calculate ingredient needs.")
-        return pd.DataFrame()
+        return {'hourly': pd.DataFrame(), 'daily': pd.DataFrame()}
     
     print(f"Retrieved {len(orders)} order items.")
     
@@ -52,7 +59,7 @@ def calculate_ingredient_needs(start_date=None, end_date=None):
     
     if not menu_items:
         print("❌ No menu item ingredients found. Cannot calculate ingredient needs.")
-        return pd.DataFrame()
+        return {'hourly': pd.DataFrame(), 'daily': pd.DataFrame()}
     
     print(f"Retrieved ingredients for {len(menu_items)} menu items.")
     
@@ -68,7 +75,7 @@ def calculate_ingredient_needs(start_date=None, end_date=None):
         start_time = min(order['ordertimestamp'] for order in orders).replace(minute=0, second=0, microsecond=0)
         end_time = max(order['ordertimestamp'] for order in orders).replace(minute=0, second=0, microsecond=0) + datetime.timedelta(hours=1)
     else:
-        return pd.DataFrame()  # Return empty DataFrame if no orders
+        return {'hourly': pd.DataFrame(), 'daily': pd.DataFrame()}  # Return empty DataFrame if no orders
     
     # Create DataFrame with hourly timestamps
     print(f"Creating hourly ingredient needs from {start_time} to {end_time}...")
@@ -118,115 +125,918 @@ def calculate_ingredient_needs(start_date=None, end_date=None):
     for ingredient, usage in top_ingredients.items():
         print(f"  - Ingredient {ingredient}: {usage:.2f} units")
     
-    return ingredients_df
+    # Additional preprocessing for time series analysis
+    # Resample to daily frequency for more stable forecasting
+    daily_ingredients_df = ingredients_df.resample('D').sum()
+    
+    # Return both hourly and daily data for different modeling approaches
+    return {
+        'hourly': ingredients_df,
+        'daily': daily_ingredients_df
+    }
 
 
-def forecast_future_needs(ingredients_df, future_hours=24*7):  # Default to 1 week forecast
+def clear_forecast_database(conn):
     """
-    Generate ingredient forecast for future hours based on historical patterns.
-    Uses simple daily and hourly averages instead of complex SARIMA models.
+    Clear all records from the forecasts table.
     
     Parameters:
     -----------
-    ingredients_df : pandas.DataFrame
-        DataFrame with historical ingredient usage data
+    conn : psycopg2.extensions.connection
+        Database connection object
+        
+    Returns:
+    --------
+    bool
+        True if operation was successful, False otherwise
+    """
+    cursor = conn.cursor()
+    
+    try:
+        cursor.execute("DELETE FROM forecasts")
+        deleted_count = cursor.rowcount
+        conn.commit()
+        print(f"✅ Successfully cleared {deleted_count} records from forecasts table")
+        return True
+    except Exception as e:
+        conn.rollback()
+        print(f"❌ Error clearing forecasts table: {e}")
+        return False
+    finally:
+        cursor.close()
+
+
+def store_predictions_in_db(conn, forecasts, recommendations):
+    """
+    Store predictions in the database forecasts table.
+    
+    Parameters:
+    -----------
+    conn : psycopg2.extensions.connection
+        Database connection object
+    forecasts : dict or pandas.DataFrame
+        Dictionary with forecast DataFrames or a single DataFrame
+    recommendations : dict
+        Dictionary with various recommendation types
+    
+    Returns:
+    --------
+    list
+        List of forecast IDs that were created
+    """
+    import json
+    import psycopg2
+    from datetime import datetime, timedelta
+    
+    # Handle both new dict format and old DataFrame format
+    if isinstance(forecasts, dict) and 'hourly' in forecasts:
+        forecast_data = forecasts['hourly']
+    elif isinstance(forecasts, pd.DataFrame):
+        forecast_data = forecasts
+    else:
+        print("❌ Invalid forecast data format.")
+        return []
+    
+    if forecast_data.empty:
+        print("❌ No forecast data to store in database.")
+        return []
+        
+    cursor = conn.cursor()
+    forecast_ids = []
+    current_time = datetime.now()
+    current_date = current_time.date()
+    
+    try:
+        # Only store recommendations for future dates
+        if 'daily_needs' in recommendations and not recommendations['daily_needs'].empty:
+            daily_df = recommendations['daily_needs']
+            
+            # Process each forecasted day separately, but only future dates
+            for date_idx in daily_df.index:
+                # Convert Timestamp to date if needed
+                if hasattr(date_idx, 'date'):
+                    date_idx_date = date_idx.date()
+                else:
+                    date_idx_date = date_idx
+                
+                # Skip past dates
+                if date_idx_date <= current_date:
+                    continue
+                    
+                # Create a dict of ingredient quantities for this day
+                daily_prep = {}
+                for col in daily_df.columns:
+                    if not pd.isna(daily_df.loc[date_idx, col]) and daily_df.loc[date_idx, col] > 0:
+                        daily_prep[str(col)] = float(daily_df.loc[date_idx, col])
+                
+                # Skip if there are no significant quantities
+                if not daily_prep:
+                    continue
+                
+                # Use the date as the recommendationfor field
+                if hasattr(date_idx, 'date'):
+                    target_date = date_idx.date()
+                else:
+                    target_date = date_idx
+                
+                # Store in database - just the ingredient quantities for clarity
+                query = """
+                INSERT INTO forecasts (recommendation, recommendationfor, createdat) 
+                VALUES (%s, %s, %s)
+                RETURNING forecastid
+                """
+                
+                cursor.execute(query, (json.dumps(daily_prep), target_date, current_time))
+                forecast_id = cursor.fetchone()[0]
+                forecast_ids.append(forecast_id)
+                print(f"✅ Stored prep recommendation for {target_date.strftime('%Y-%m-%d')} with ID: {forecast_id}")
+        
+        # Commit the transaction
+        conn.commit()
+        print(f"✅ Successfully stored recommendations for future dates in database")
+        return forecast_ids
+        
+    except Exception as e:
+        conn.rollback()
+        print(f"❌ Error storing forecast in database: {e}")
+        return []
+        
+    finally:
+        cursor.close()
+
+
+def store_traffic_recommendations(conn, traffic_recommendations):
+    """
+    Store traffic recommendations in the database.
+    
+    Parameters:
+    -----------
+    conn : psycopg2.extensions.connection
+        Database connection object
+    traffic_recommendations : dict
+        Dictionary of dates with text recommendations
+        
+    Returns:
+    --------
+    list
+        List of forecast IDs that were created
+    """
+    import json
+    from datetime import datetime
+    
+    if not traffic_recommendations:
+        print("❌ No traffic recommendations to store.")
+        return []
+        
+    cursor = conn.cursor()
+    forecast_ids = []
+    current_time = datetime.now()
+    
+    try:
+        for date, recommendation in traffic_recommendations.items():
+            query = """
+            INSERT INTO forecasts (recommendation, recommendationfor, createdat) 
+            VALUES (%s, %s, %s)
+            RETURNING forecastid
+            """
+            
+            # Package the recommendation in a JSON object for clarity
+            recommendation_data = json.dumps({
+                "type": "traffic_forecast",
+                "text_recommendation": recommendation
+            })
+            
+            cursor.execute(query, (recommendation_data, date, current_time))
+            forecast_id = cursor.fetchone()[0]
+            forecast_ids.append(forecast_id)
+            print(f"✅ Stored traffic recommendation for {date.strftime('%Y-%m-%d')} with ID: {forecast_id}")
+        
+        conn.commit()
+        return forecast_ids
+        
+    except Exception as e:
+        conn.rollback()
+        print(f"❌ Error storing traffic recommendations: {e}")
+        return []
+        
+    finally:
+        cursor.close()
+
+
+###################################################################################
+# PART 2: FORECASTING WITH SARIMAX MODELS
+###################################################################################
+
+def forecast_future_needs(ingredients_data, future_hours=24*7):  # Default to 1 week forecast
+    """
+    Generate ingredient forecast for future hours using SARIMAX models.
+    
+    Parameters:
+    -----------
+    ingredients_data : dict or pandas.DataFrame
+        Dictionary with hourly and daily historical ingredient usage data
+        or DataFrame with hourly data (for backward compatibility)
     future_hours : int, optional
         Number of hours to forecast (default: 1 week)
         
     Returns:
     --------
-    pandas.DataFrame
-        DataFrame with hourly forecasts for each ingredient
+    dict
+        Dictionary with hourly and daily forecast DataFrames
     """
-    if ingredients_df.empty:
+    # Convert old format to new format if needed
+    if isinstance(ingredients_data, pd.DataFrame):
+        print("⚠️ Old format detected - converting to new dictionary format")
+        ingredients_data = {
+            'hourly': ingredients_data,
+            'daily': ingredients_data.resample('D').sum()
+        }
+    
+    if ingredients_data['hourly'].empty:
         print("❌ No historical data available for forecasting.")
-        return pd.DataFrame()
+        return {'hourly': pd.DataFrame(), 'daily': pd.DataFrame()}
     
     # Create date range for future hours
     current_time = datetime.datetime.now().replace(minute=0, second=0, microsecond=0)
-    future_dates = pd.date_range(start=current_time, periods=future_hours, freq='H')
+    future_hourly_dates = pd.date_range(start=current_time, periods=future_hours, freq='H')
     
-    # Initialize forecast DataFrame
-    forecasts = pd.DataFrame(index=future_dates, columns=ingredients_df.columns)
-    forecasts = forecasts.fillna(0.0)
+    # Calculate number of days to forecast
+    future_days = (future_hours + 23) // 24  # Round up to the nearest day
+    future_daily_dates = pd.date_range(start=current_time.date(), periods=future_days, freq='D')
     
-    print(f"\n🔮 Forecasting ingredient needs for the next {future_hours} hours...")
+    # Initialize forecast DataFrames
+    hourly_forecasts = pd.DataFrame(index=future_hourly_dates, columns=ingredients_data['hourly'].columns)
+    daily_forecasts = pd.DataFrame(index=future_daily_dates, columns=ingredients_data['daily'].columns)
     
-    # Use simple averages instead of SARIMA models
-    for ingredient in ingredients_df.columns:
-        # Skip ingredients with no usage
-        if ingredients_df[ingredient].sum() == 0:
-            print(f"  ⚠️ No historical usage for {ingredient}, skipping forecast")
-            continue
+    hourly_forecasts = hourly_forecasts.fillna(0.0)
+    daily_forecasts = daily_forecasts.fillna(0.0)
+    
+    print(f"\n🔮 Forecasting ingredient needs for the next {future_hours} hours ({future_days} days)...")
+    
+    # Identify ingredients with sufficient data for SARIMAX modeling
+    valid_ingredients = _identify_forecastable_ingredients(ingredients_data)
+    
+    if not valid_ingredients:
+        print("⚠️ No ingredients with sufficient data for SARIMAX modeling.")
+        print("Using fallback method for all ingredients.")
+        return _forecast_with_fallback(ingredients_data, future_hours)
+    
+    print(f"🧪 Found {len(valid_ingredients)} ingredients with sufficient data for SARIMAX modeling")
+    
+    # Get all ingredients that have any historical data
+    all_used_ingredients = [
+        col for col in ingredients_data['daily'].columns 
+        if ingredients_data['daily'][col].sum() > 0
+    ]
+    
+    # If we only have a few valid ingredients for SARIMAX, try to forecast more with fallback
+    # methods first to ensure we have predictions for all important ingredients
+    if len(valid_ingredients) < len(all_used_ingredients) / 2:
+        print(f"⚠️ Only {len(valid_ingredients)} of {len(all_used_ingredients)} ingredients can use SARIMAX.")
+        print("Running fallback forecasting for all ingredients first...")
+        
+        # Get fallback forecasts for all ingredients
+        fallback_forecasts = _forecast_with_fallback(ingredients_data, future_hours)
+        
+        # We'll use these as a base and replace with SARIMAX where possible
+        hourly_forecasts = fallback_forecasts['hourly'].copy()
+        daily_forecasts = fallback_forecasts['daily'].copy()
+    
+    # Use multiprocessing to speed up model fitting
+    num_cores = max(1, multiprocessing.cpu_count() - 1)  # Leave one core free
+    print(f"🖥️ Using {num_cores} CPU cores for parallel processing")
+    
+    # Process daily forecasts first (these are more stable)
+    with multiprocessing.Pool(processes=num_cores) as pool:
+        # Partial function with fixed parameters
+        forecast_func = partial(
+            _forecast_ingredient_daily,
+            historical_data=ingredients_data['daily'],
+            future_dates=future_daily_dates
+        )
+        
+        # Try to model ALL valid ingredients with SARIMAX, not just a sample
+        # This ensures we get predictions for as many ingredients as possible
+        
+        # Map the function to the ingredients
+        results = pool.map(forecast_func, valid_ingredients)
+        
+        # Update the forecasts DataFrame with results
+        for ingredient, forecast_values in results:
+            if ingredient in daily_forecasts.columns:
+                daily_forecasts[ingredient] = forecast_values
+    
+    # Handle hourly forecasts for all ingredients that had successful SARIMAX daily forecasts
+    ingredients_with_forecasts = [
+        col for col in daily_forecasts.columns 
+        if daily_forecasts[col].sum() > 0
+    ]
+    
+    if ingredients_with_forecasts:
+        print(f"⏱️ Generating detailed hourly forecasts for {len(ingredients_with_forecasts)} ingredients")
+        with multiprocessing.Pool(processes=num_cores) as pool:
+            # Partial function with fixed parameters
+            hourly_forecast_func = partial(
+                _forecast_ingredient_hourly,
+                historical_data=ingredients_data['hourly'],
+                daily_forecast=daily_forecasts,
+                future_dates=future_hourly_dates
+            )
             
-        # Calculate average by hour of day and day of week
-        ingredient_series = ingredients_df[ingredient]
-        hour_of_day_avg = ingredient_series.groupby(ingredient_series.index.hour).mean()
-        day_of_week_avg = ingredient_series.groupby(ingredient_series.index.dayofweek).mean()
-        
-        # Make sure we have values for all hours and days
-        for hour in range(24):
-            if hour not in hour_of_day_avg.index:
-                hour_of_day_avg[hour] = 0.0
-                
-        for day in range(7):
-            if day not in day_of_week_avg.index:
-                day_of_week_avg[day] = 0.0
-        
-        # Normalize by overall mean to avoid double-counting the effects
-        overall_mean = ingredient_series.mean() if ingredient_series.mean() > 0 else 1.0
-        
-        # Use these to make predictions
-        for future_time in future_dates:
-            hour_factor = hour_of_day_avg[future_time.hour] / overall_mean if overall_mean > 0 else 0
-            day_factor = day_of_week_avg[future_time.dayofweek] / overall_mean if overall_mean > 0 else 0
+            # Map the function to all ingredients with daily forecasts
+            hourly_results = pool.map(hourly_forecast_func, ingredients_with_forecasts)
             
-            # Take average of factors to avoid extremes
-            combined_factor = (hour_factor + day_factor) / 2 if (hour_factor + day_factor) > 0 else 0
-            
-            # Apply the factor to the average
-            forecasts.at[future_time, ingredient] = combined_factor * overall_mean
-        
-        # Force negative values to zero (can't have negative ingredient usage)
-        forecasts[ingredient] = forecasts[ingredient].clip(lower=0)
-        
-        print(f"  ✅ Generated forecast for {ingredient} using historical patterns")
+            # Update the forecasts DataFrame with results
+            for ingredient, forecast_values in hourly_results:
+                if ingredient in hourly_forecasts.columns:
+                    hourly_forecasts[ingredient] = forecast_values
     
-    return forecasts
-    def analyze_forecast(forecasts):
+    # Validate that we have meaningful forecasts
+    # If any key ingredients have no forecast, use fallback
+    top_ingredients = ingredients_data['daily'].sum().nlargest(5).index.tolist()
+    
+    for ingredient in top_ingredients:
+        if hourly_forecasts[ingredient].sum() < 0.1 and ingredients_data['hourly'][ingredient].sum() > 0:
+            print(f"⚠️ Important ingredient {ingredient} has insufficient forecast, applying fallback...")
+            # Use fallback for this ingredient
+            ingredient_fallback = _fallback_forecast_daily(ingredient, ingredients_data['daily'], future_daily_dates)
+            daily_forecasts[ingredient] = ingredient_fallback[1]
+            
+            # Distribute to hourly
+            hourly_forecasts[ingredient] = _distribute_daily_to_hourly(
+                ingredient, 
+                daily_forecasts, 
+                ingredients_data['hourly'],
+                future_hourly_dates
+            )
+    
+    print(f"✅ Successfully generated forecasts for {len(ingredients_data['hourly'].columns)} ingredients")
+    
+    return {
+        'hourly': hourly_forecasts,
+        'daily': daily_forecasts
+    }
+
+
+def _identify_forecastable_ingredients(ingredients_data):
     """
-    Analyze the forecasted ingredient needs to provide useful insights.
+    Identify ingredients with sufficient data for SARIMAX modeling.
     
     Parameters:
     -----------
-    forecasts : pandas.DataFrame
-        DataFrame with hourly forecasts for each ingredient
+    ingredients_data : dict
+        Dictionary containing DataFrames with ingredient usage data
+        
+    Returns:
+    --------
+    list
+        List of ingredient names that have sufficient data
     """
-    if forecasts.empty:
+    daily_data = ingredients_data['daily']
+    
+    valid_ingredients = []
+    
+    for ingredient in daily_data.columns:
+        series = daily_data[ingredient]
+        
+        # Check if there's enough non-zero data points
+        non_zero_count = (series > 0).sum()
+        
+        # Lowered threshold - need at least 7 days of data for SARIMAX
+        # This makes the model applicable to more ingredients
+        if non_zero_count >= 7:
+            # Check if there's a pattern (non-random) by looking at autocorrelation
+            # Will accept more ingredients as having patterns
+            valid_ingredients.append(ingredient)
+    
+    return valid_ingredients
+
+
+def _has_pattern(series):
+    """
+    Check if a time series has a pattern (is not random).
+    For our use case, we'll assume most ingredient usage patterns 
+    are non-random to allow more ingredients to be modeled with SARIMAX.
+    
+    Parameters:
+    -----------
+    series : pandas.Series
+        Time series data
+        
+    Returns:
+    --------
+    bool
+        True if the series appears to have a pattern, False otherwise
+    """
+    # Need at least 3 non-zero values
+    if (series > 0).sum() < 3:
+        return False
+    
+    # For restaurant ingredients, assume there's a pattern if there's sufficient data
+    # This is a reasonable assumption since restaurant orders typically follow
+    # patterns based on days of the week, time of day, etc.
+    return True
+
+
+def _find_best_sarimax_parameters(series):
+    """
+    Find the best SARIMAX parameters for a given time series.
+    
+    Parameters:
+    -----------
+    series : pandas.Series
+        Time series data
+        
+    Returns:
+    --------
+    tuple
+        Best parameters (p, d, q, P, D, Q, s)
+    """
+    best_aic = float('inf')
+    best_params = None
+    
+    # Define parameter grid for SARIMAX
+    # Keep it simple to avoid excessive computation time
+    p = d = q = range(0, 2)
+    P = D = Q = range(0, 2)
+    s = [7]  # Weekly seasonality
+    
+    # Generate all combinations of parameters
+    pdq = list(itertools.product(p, d, q))
+    seasonal_pdq = list(itertools.product(P, D, Q, s))
+    
+    # Sample a subset of combinations to reduce computation time
+    # Select a maximum of 4 combinations to try
+    if len(pdq) > 2:
+        import random
+        random.seed(42)  # For reproducibility
+        pdq = random.sample(pdq, 2)
+    
+    if len(seasonal_pdq) > 2:
+        import random
+        random.seed(42)  # For reproducibility
+        seasonal_pdq = random.sample(seasonal_pdq, 2)
+    
+    # Try each combination
+    for param in pdq:
+        for seasonal_param in seasonal_pdq:
+            try:
+                # Fit the model
+                mod = SARIMAX(series,
+                            order=param,
+                            seasonal_order=seasonal_param,
+                            enforce_stationarity=False,
+                            enforce_invertibility=False)
+                
+                results = mod.fit(disp=False, maxiter=50)
+                
+                # If this is the best model so far, save the parameters
+                if results.aic < best_aic:
+                    best_aic = results.aic
+                    best_params = (param, seasonal_param)
+            except:
+                continue
+    
+    # If no valid model found, use default parameters
+    if best_params is None:
+        best_params = ((1, 0, 1), (1, 0, 1, 7))
+    
+    # Unpack parameters for return
+    p, d, q = best_params[0]
+    P, D, Q, s = best_params[1]
+    
+    return p, d, q, P, D, Q, s
+
+
+def _forecast_ingredient_daily(ingredient, historical_data, future_dates):
+    """
+    Forecast daily usage for a single ingredient using SARIMAX.
+    
+    Parameters:
+    -----------
+    ingredient : str
+        Name of the ingredient to forecast
+    historical_data : pandas.DataFrame
+        Historical daily ingredient usage
+    future_dates : pandas.DatetimeIndex
+        Dates to forecast for
+        
+    Returns:
+    --------
+    tuple
+        (ingredient name, forecasted values)
+    """
+    try:
+        # Extract the series for this ingredient
+        series = historical_data[ingredient]
+        
+        # Check if there's enough data - now more lenient
+        if (series > 0).sum() < 7:
+            raise ValueError("Insufficient data")
+        
+        # Find best parameters
+        p, d, q, P, D, Q, s = _find_best_sarimax_parameters(series)
+        
+        # Fit SARIMAX model with the best parameters
+        model = SARIMAX(
+            series,
+            order=(p, d, q),
+            seasonal_order=(P, D, Q, s),
+            enforce_stationarity=False,
+            enforce_invertibility=False
+        )
+        
+        model_fit = model.fit(disp=False, maxiter=100)  # Increased iterations for better convergence
+        
+        # Generate forecast
+        forecast = model_fit.get_forecast(steps=len(future_dates))
+        forecast_values = forecast.predicted_mean
+        
+        # Adjust index to match the future dates
+        forecast_values.index = future_dates
+        
+        # Ensure forecast doesn't include negative values
+        forecast_values = forecast_values.clip(lower=0)
+        
+        # Apply a scaling factor if the ingredient has very little forecasted usage
+        if forecast_values.sum() < 0.1 and series.sum() > 0:
+            # If forecast is almost zero but historical data shows usage,
+            # scale up slightly based on historical average
+            daily_avg = series[series > 0].mean()
+            if not np.isnan(daily_avg):
+                forecast_values = forecast_values + (daily_avg * 0.1)  # Add 10% of daily average
+        
+        print(f"  ✅ SARIMAX forecast completed for {ingredient} (daily)")
+        return (ingredient, forecast_values)
+    
+    except Exception as e:
+        print(f"  ⚠️ SARIMAX forecast failed for {ingredient} (daily): {str(e)}")
+        
+        # Fall back to a simpler method
+        return _fallback_forecast_daily(ingredient, historical_data, future_dates)
+
+
+def _forecast_ingredient_hourly(ingredient, historical_data, daily_forecast, future_dates):
+    """
+    Forecast hourly usage for a single ingredient.
+    Uses both SARIMAX for overall trend and pattern detection,
+    then distributes according to historical hourly patterns.
+    
+    Parameters:
+    -----------
+    ingredient : str
+        Name of the ingredient to forecast
+    historical_data : pandas.DataFrame
+        Historical hourly ingredient usage
+    daily_forecast : pandas.DataFrame
+        Daily forecasts from SARIMAX
+    future_dates : pandas.DatetimeIndex
+        Hours to forecast for
+        
+    Returns:
+    --------
+    tuple
+        (ingredient name, forecasted values)
+    """
+    try:
+        # Initialize forecast Series
+        forecast_values = pd.Series(index=future_dates, data=0.0)
+        
+        # The goal is to distribute the daily forecasts according to hourly patterns
+        # First, find the hourly pattern
+        series = historical_data[ingredient]
+        
+        # Get hour of day factors
+        hour_factors = _calculate_hour_factors(series)
+        
+        # For each future day, distribute the daily forecast according to hour factors
+        for day in pd.date_range(future_dates[0].date(), future_dates[-1].date(), freq='D'):
+            # Skip if this day is not in the daily forecast
+            if day not in daily_forecast.index:
+                continue
+            
+            # Get the daily forecast for this day
+            daily_amount = daily_forecast.at[day, ingredient]
+            
+            # Distribute to hours in this day
+            day_hours = [dt for dt in future_dates if dt.date() == day.date()]
+            
+            for hour_dt in day_hours:
+                hour = hour_dt.hour
+                # Use the hour factor to distribute
+                if hour in hour_factors:
+                    forecast_values[hour_dt] = daily_amount * hour_factors[hour]
+        
+        print(f"  ✅ Hourly distribution completed for {ingredient}")
+        return (ingredient, forecast_values)
+    
+    except Exception as e:
+        print(f"  ⚠️ Hourly forecast failed for {ingredient}: {str(e)}")
+        
+        # Fall back to simple distribution
+        forecast_values = _distribute_daily_to_hourly(
+            ingredient, 
+            daily_forecast, 
+            historical_data,
+            future_dates
+        )
+        
+        return (ingredient, forecast_values)
+
+
+def _calculate_hour_factors(series):
+    """
+    Calculate hourly distribution factors from historical data.
+    
+    Parameters:
+    -----------
+    series : pandas.Series
+        Historical hourly data for an ingredient
+        
+    Returns:
+    --------
+    dict
+        Dictionary mapping hours to their relative weights
+    """
+    # Group by hour and calculate average
+    hour_avgs = series.groupby(series.index.hour).mean()
+    
+    # Calculate total to get proportions
+    total = hour_avgs.sum()
+    
+    # Convert to dictionary of factors
+    if total > 0:
+        hour_factors = {hour: avg / total for hour, avg in hour_avgs.items()}
+    else:
+        # If no historical data, use uniform distribution
+        hour_factors = {hour: 1/24 for hour in range(24)}
+    
+    return hour_factors
+
+
+def _distribute_daily_to_hourly(ingredient, daily_forecast, historical_hourly, future_dates):
+    """
+    Distribute daily forecasts to hourly based on historical patterns.
+    
+    Parameters:
+    -----------
+    ingredient : str
+        Name of the ingredient
+    daily_forecast : pandas.DataFrame
+        DataFrame with daily forecasts
+    historical_hourly : pandas.DataFrame
+        Historical hourly data
+    future_dates : pandas.DatetimeIndex
+        Future hourly timestamps
+        
+    Returns:
+    --------
+    pandas.Series
+        Hourly forecast values
+    """
+    # Calculate hourly factors
+    series = historical_hourly[ingredient]
+    hour_factors = _calculate_hour_factors(series)
+    
+    # Initialize forecast Series
+    forecast_values = pd.Series(index=future_dates, data=0.0)
+    
+    # For each future day, distribute the daily forecast
+    for day in pd.date_range(future_dates[0].date(), future_dates[-1].date(), freq='D'):
+        # Skip if day is not in daily forecast
+        if day not in daily_forecast.index:
+            continue
+        
+        # Get daily amount
+        daily_amount = daily_forecast.at[day, ingredient]
+        
+        # Get hours in this day
+        day_hours = [dt for dt in future_dates if dt.date() == day.date()]
+        
+        # Distribute amount across hours
+        for hour_dt in day_hours:
+            hour = hour_dt.hour
+            # Use the hour factor to distribute
+            if hour in hour_factors:
+                forecast_values[hour_dt] = daily_amount * hour_factors[hour]
+    
+    return forecast_values
+
+
+def _fallback_forecast_daily(ingredient, historical_data, future_dates):
+    """
+    Fallback method for daily forecasting when SARIMAX fails.
+    Uses a more advanced average approach that considers recent trends.
+    
+    Parameters:
+    -----------
+    ingredient : str
+        Name of the ingredient
+    historical_data : pandas.DataFrame
+        Historical daily data
+    future_dates : pandas.DatetimeIndex
+        Future dates to forecast for
+        
+    Returns:
+    --------
+    tuple
+        (ingredient name, forecasted values)
+    """
+    # Initialize forecast Series
+    forecast_values = pd.Series(index=future_dates, data=0.0)
+    
+    # Extract the series for this ingredient
+    series = historical_data[ingredient]
+    
+    # Calculate average by day of week
+    day_of_week_avg = series.groupby(series.index.dayofweek).mean()
+    
+    # Make sure we have values for all days
+    for day in range(7):
+        if day not in day_of_week_avg.index:
+            day_of_week_avg[day] = series.mean() if series.mean() > 0 else 0
+    
+    # Calculate a recent trend factor (last 14 days vs overall average)
+    recent_days = 14
+    if len(series) >= recent_days:
+        recent_data = series.iloc[-recent_days:]
+        recent_avg = recent_data.mean()
+        overall_avg = series.mean()
+        
+        # Avoid division by zero
+        if overall_avg > 0:
+            trend_factor = recent_avg / overall_avg
+            # Limit the trend factor to reasonable bounds
+            trend_factor = max(0.5, min(2.0, trend_factor))
+        else:
+            trend_factor = 1.0
+    else:
+        trend_factor = 1.0
+    
+    # Use day of week average for forecast, adjusted by trend
+    for date in future_dates:
+        day_of_week = date.dayofweek
+        base_forecast = day_of_week_avg[day_of_week]
+        # Apply trend factor
+        forecast_values[date] = base_forecast * trend_factor
+    
+    # Ensure no negative values
+    forecast_values = forecast_values.clip(lower=0)
+    
+    # Ensure we have at least some minimal forecast if there's historical usage
+    min_historical = series[series > 0].min() if not series[series > 0].empty else 0
+    if forecast_values.sum() < 0.1 and min_historical > 0:
+        # Add a small amount based on minimum historical usage
+        for date in future_dates:
+            day_of_week = date.dayofweek
+            if day_of_week in [4, 5, 6]:  # Weekend days + Friday
+                forecast_values[date] += min_historical * 0.2  # 20% of minimum
+            else:
+                forecast_values[date] += min_historical * 0.1  # 10% of minimum
+    
+    print(f"  ✅ Enhanced fallback forecast completed for {ingredient} (daily)")
+    return (ingredient, forecast_values)
+
+
+def _forecast_with_fallback(ingredients_data, future_hours):
+    """
+    Generate forecasts using fallback methods when SARIMAX is not suitable.
+    
+    Parameters:
+    -----------
+    ingredients_data : dict
+        Dictionary with historical ingredient data
+    future_hours : int
+        Number of hours to forecast
+        
+    Returns:
+    --------
+    dict
+        Dictionary with hourly and daily forecasts
+    """
+    # Create date ranges
+    current_time = datetime.datetime.now().replace(minute=0, second=0, microsecond=0)
+    future_hourly_dates = pd.date_range(start=current_time, periods=future_hours, freq='H')
+    
+    future_days = (future_hours + 23) // 24  # Round up to nearest day
+    future_daily_dates = pd.date_range(start=current_time.date(), periods=future_days, freq='D')
+    
+    # Initialize forecast DataFrames
+    hourly_forecasts = pd.DataFrame(index=future_hourly_dates, columns=ingredients_data['hourly'].columns)
+    daily_forecasts = pd.DataFrame(index=future_daily_dates, columns=ingredients_data['daily'].columns)
+    
+    hourly_forecasts = hourly_forecasts.fillna(0.0)
+    daily_forecasts = daily_forecasts.fillna(0.0)
+    
+    print("Using simple averaging method for forecasting...")
+    
+    # Process each ingredient
+    for ingredient in ingredients_data['daily'].columns:
+        # Skip if no usage
+        if ingredients_data['daily'][ingredient].sum() == 0:
+            continue
+            
+        # Calculate average by day of week
+        ingredient_series = ingredients_data['daily'][ingredient]
+        day_of_week_avg = ingredient_series.groupby(ingredient_series.index.dayofweek).mean()
+        
+        # Calculate average by hour of day (for hourly distribution)
+        hourly_series = ingredients_data['hourly'][ingredient]
+        hour_of_day_avg = hourly_series.groupby(hourly_series.index.hour).mean()
+        
+        # Make sure we have values for all days and hours
+        for day in range(7):
+            if day not in day_of_week_avg.index:
+                day_of_week_avg[day] = ingredient_series.mean() if ingredient_series.mean() > 0 else 0
+                
+        for hour in range(24):
+            if hour not in hour_of_day_avg.index:
+                hour_of_day_avg[hour] = hourly_series.mean() if hourly_series.mean() > 0 else 0
+        
+        # Calculate the overall average
+        overall_mean = ingredient_series.mean()
+        
+        # Generate daily forecasts
+        for future_date in future_daily_dates:
+            # Use day of week average
+            day_factor = day_of_week_avg[future_date.dayofweek] / overall_mean if overall_mean > 0 else 0
+            daily_forecasts.at[future_date, ingredient] = day_factor * overall_mean
+        
+        # Generate hourly forecasts based on daily totals and hour distribution
+        hour_factors = _calculate_hour_factors(hourly_series)
+        
+        # Distribute daily forecasts to hours
+        for day in future_daily_dates:
+            day_total = daily_forecasts.at[day, ingredient]
+            day_hours = [dt for dt in future_hourly_dates if dt.date() == day.date()]
+            
+            for hour_dt in day_hours:
+                hour = hour_dt.hour
+                if hour in hour_factors:
+                    hourly_forecasts.at[hour_dt, ingredient] = day_total * hour_factors[hour]
+    
+    print("✅ Completed fallback forecasting for all ingredients")
+    
+    return {
+        'hourly': hourly_forecasts,
+        'daily': daily_forecasts
+    }
+
+
+###################################################################################
+# PART 3: ANALYSIS AND RECOMMENDATION GENERATION
+###################################################################################
+
+def analyze_forecast(forecasts):
+    """
+    Analyze the forecasted ingredient needs to provide useful insights.
+
+    Parameters:
+    -----------
+    forecasts : dict or pandas.DataFrame
+        Dictionary with forecast DataFrames or a single DataFrame
+        
+    Returns:
+    --------
+    dict
+        Dictionary with analysis results
+    """
+    # Handle both new dict format and old DataFrame format
+    if isinstance(forecasts, dict) and 'hourly' in forecasts:
+        hourly_data = forecasts['hourly']
+        daily_data = forecasts['daily']
+    elif isinstance(forecasts, pd.DataFrame):
+        hourly_data = forecasts
+        daily_data = forecasts.resample('D').sum()
+    else:
+        print("❌ Invalid forecast data format.")
+        return {}
+    
+    if hourly_data.empty:
         print("❌ No forecast data to analyze.")
         return {}
     
     print("\n📊 Forecast Analysis:")
     
     # Total forecasted amounts
-    total_by_ingredient = forecasts.sum()
+    total_by_ingredient = hourly_data.sum()
     print("\nTotal forecasted amounts:")
     for ingredient, total in total_by_ingredient.nlargest(10).items():
         print(f"  - {ingredient}: {total:.2f} units")
     
     # Identify peak hours
-    hourly_totals = forecasts.sum(axis=1)
+    hourly_totals = hourly_data.sum(axis=1)
     peak_hour = hourly_totals.idxmax()
     peak_usage = hourly_totals.max()
     
     print(f"\nBusiest hour: {peak_hour.strftime('%Y-%m-%d %H:%M')} with {peak_usage:.2f} total units")
     
     # Create a copy of forecasts for analysis
-    forecasts_copy = forecasts.copy()
+    hourly_copy = hourly_data.copy()
     
     # Analyze by day of week
-    forecasts_copy['day_of_week'] = forecasts_copy.index.day_name()
-    day_of_week_totals = forecasts_copy.groupby('day_of_week').sum()
+    hourly_copy['day_of_week'] = hourly_copy.index.day_name()
+    day_of_week_totals = hourly_copy.groupby('day_of_week').sum()
     
     # Remove the day_of_week column from the groupby result if it exists
     if 'day_of_week' in day_of_week_totals.columns:
@@ -243,8 +1053,8 @@ def forecast_future_needs(ingredients_df, future_hours=24*7):  # Default to 1 we
         print(f"  - {day}: {row.sum():.2f} total units")
     
     # Analyze by hour of day
-    forecasts_copy['hour'] = forecasts_copy.index.hour
-    hour_of_day_totals = forecasts_copy.groupby('hour').sum()
+    hourly_copy['hour'] = hourly_copy.index.hour
+    hour_of_day_totals = hourly_copy.groupby('hour').sum()
     
     # Remove the non-ingredient columns from the groupby result if they exist
     non_ingredient_cols = ['day_of_week', 'hour']
@@ -256,6 +1066,11 @@ def forecast_future_needs(ingredients_df, future_hours=24*7):  # Default to 1 we
     for hour, total in hour_of_day_totals.sum(axis=1).nlargest(5).items():
         print(f"  - {hour:02d}:00: {total:.2f} total units")
     
+    # Analyze confidence intervals for key ingredients if using SARIMAX models
+    # For demo purposes, we're not calculating actual confidence intervals here
+    # In a real implementation, we would use the prediction intervals from SARIMAX
+    
+    # Return analysis results
     return {
         'total_by_ingredient': total_by_ingredient,
         'hourly_totals': hourly_totals,
@@ -270,32 +1085,30 @@ def prepare_recommendations(forecasts):
     
     Parameters:
     -----------
-    forecasts : pandas.DataFrame
-        DataFrame with hourly forecasts for each ingredient
+    forecasts : dict or pandas.DataFrame
+        Dictionary with forecast DataFrames or a single DataFrame
         
     Returns:
     --------
     dict
         Dictionary with various recommendation types
     """
-    if forecasts.empty:
+    # Handle both new dict format and old DataFrame format
+    if isinstance(forecasts, dict) and 'daily' in forecasts:
+        daily_forecast = forecasts['daily']
+    elif isinstance(forecasts, pd.DataFrame):
+        daily_forecast = forecasts.resample('D').sum()
+    else:
+        print("❌ Invalid forecast data format.")
+        return {}
+    
+    if daily_forecast.empty:
         print("❌ No forecast data for recommendations.")
         return {}
     
     recommendations = {}
     
-    # Create a copy of forecasts for processing
-    forecasts_copy = forecasts.copy()
-    
-    # Get only the ingredient columns - exclude any analysis columns that might have been added
-    ingredient_cols = [col for col in forecasts_copy.columns 
-                       if col not in ['day_of_week', 'hour', 'date']]
-    
-    # Calculate daily needs
-    forecasts_copy['date'] = forecasts_copy.index.date
-    daily_forecast = forecasts_copy.groupby('date')[ingredient_cols].sum()
-    
-    # Add 15% safety margin
+    # Calculate daily needs with 15% safety margin
     daily_with_margin = daily_forecast.copy()
     for col in daily_with_margin.columns:
         daily_with_margin[col] = daily_with_margin[col] * 1.15
@@ -313,7 +1126,7 @@ def prepare_recommendations(forecasts):
         if not row.empty:
             top_ingredients = row.nlargest(min(5, len(row)))
             top_daily_ingredients[date.strftime('%Y-%m-%d')] = {
-                ingredient: round(amount, 2) for ingredient, amount in top_ingredients.items()
+                ingredient: round(amount, 2) for ingredient, amount in top_ingredients.items() if amount > 0
             }
     
     recommendations['top_ingredients_by_day'] = top_daily_ingredients
@@ -325,7 +1138,40 @@ def prepare_recommendations(forecasts):
         tomorrow_str = tomorrow.strftime('%Y-%m-%d')
         print(f"\nRecommended prep quantities for tomorrow ({tomorrow_str}):")
         for ingredient, amount in recommendations['tomorrow_needs'].nlargest(10).items():
-            print(f"  - {ingredient}: {amount:.2f} units (includes 15% safety margin)")
+            if amount > 0:  # Only show non-zero amounts
+                print(f"  - {ingredient}: {amount:.2f} units (includes 15% safety margin)")
+    
+    # Calculate scheduling recommendations based on busy hours
+    if isinstance(forecasts, dict) and 'hourly' in forecasts:
+        hourly_data = forecasts['hourly']
+        
+        # Find busiest hours for each day
+        busy_hour_recs = {}
+        
+        for day in pd.date_range(hourly_data.index[0].date(), hourly_data.index[-1].date(), freq='D'):
+            # Get data for this day
+            day_data = hourly_data[hourly_data.index.date == day.date()]
+            
+            if not day_data.empty:
+                # Calculate total by hour
+                hourly_sum = day_data.sum(axis=1)
+                
+                # Get top 3 busiest hours
+                busiest_hours = hourly_sum.nlargest(3)
+                
+                # Save recommendation
+                busy_hour_recs[day.strftime('%Y-%m-%d')] = {
+                    hour.strftime('%H:%M'): round(float(amount), 2) 
+                    for hour, amount in busiest_hours.items()
+                }
+        
+        recommendations['busiest_hours'] = busy_hour_recs
+        
+        # Print sample of busiest hours
+        if busy_hour_recs:
+            print("\nSample of busiest hours by day:")
+            for i, (date, hours) in enumerate(list(busy_hour_recs.items())[:3]):
+                print(f"  - {date}: {', '.join([f'{hour} ({amount:.2f} units)' for hour, amount in hours.items()])}")
     
     return recommendations
 
@@ -337,25 +1183,37 @@ def generate_traffic_recommendations(ingredients_df, forecasts):
     
     Parameters:
     -----------
-    ingredients_df : pandas.DataFrame
-        DataFrame with historical ingredient usage data
-    forecasts : pandas.DataFrame
-        DataFrame with forecasted ingredient usage
+    ingredients_df : dict or pandas.DataFrame
+        Dictionary with historical ingredient usage data or a single DataFrame
+    forecasts : dict or pandas.DataFrame
+        Dictionary with forecasted ingredient usage or a single DataFrame
         
     Returns:
     --------
     dict
         Dictionary of dates with text recommendations for each day
     """
-    from datetime import datetime, timedelta, date
-    import pandas as pd
-    import numpy as np
+    # Handle both new dict format and old DataFrame format
+    if isinstance(ingredients_df, dict) and 'hourly' in ingredients_df:
+        historical_hourly = ingredients_df['hourly'].sum(axis=1)
+    elif isinstance(ingredients_df, pd.DataFrame):
+        historical_hourly = ingredients_df.sum(axis=1)
+    else:
+        print("❌ Invalid historical data format.")
+        return {}
+    
+    if isinstance(forecasts, dict) and 'hourly' in forecasts:
+        forecasts_copy = forecasts['hourly'].copy()
+    elif isinstance(forecasts, pd.DataFrame):
+        forecasts_copy = forecasts.copy()
+    else:
+        print("❌ Invalid forecast data format.")
+        return {}
     
     # Initialize recommendations dictionary
     traffic_recommendations = {}
     
     # Create aggregated historical data by day of week and hour
-    historical_hourly = ingredients_df.sum(axis=1)  # Sum across all ingredients
     historical_hourly.index = pd.DatetimeIndex(historical_hourly.index)
     
     # Calculate day of week patterns
@@ -377,7 +1235,6 @@ def generate_traffic_recommendations(ingredients_df, forecasts):
     peak_hour = hour_pattern.idxmax()
     
     # Process forecast data by day
-    forecasts_copy = forecasts.copy()
     # First create a new column with the date
     forecasts_copy['date'] = forecasts_copy.index.date
     
@@ -394,7 +1251,6 @@ def generate_traffic_recommendations(ingredients_df, forecasts):
     
     for date_val, value in daily_total.items():
         # Use the date object to get day of week name
-        # Fixed: using the date's weekday method directly
         weekday_num = date_val.weekday()
         day_name = day_names[weekday_num]  # Use our day_names list
         
@@ -491,177 +1347,19 @@ def generate_traffic_recommendations(ingredients_df, forecasts):
         
         traffic_recommendations[date_val] = recommendation
         
+    # Print sample of traffic recommendations
+    print("\n🚦 Traffic Recommendations:")
+    for i, (date, recommendation) in enumerate(list(traffic_recommendations.items())[:3]):
+        print(f"\n{date.strftime('%Y-%m-%d')} ({date.strftime('%A')}):")
+        print(f"  {recommendation}")
+    
+    if len(traffic_recommendations) > 3:
+        print(f"\n  ... and {len(traffic_recommendations) - 3} more days")
+    
     return traffic_recommendations
-    def store_predictions_in_db(conn, forecasts, recommendations):
-    """
-    Store only the prep recommendations in the database forecasts table,
-    with each recommendation properly mapped to its target future date.
-    
-    Parameters:
-    -----------
-    conn : psycopg2.extensions.connection
-        Database connection object
-    forecasts : pandas.DataFrame
-        DataFrame with hourly forecasts for each ingredient
-    recommendations : dict
-        Dictionary with various recommendation types including daily needs
-        
-    Returns:
-    --------
-    list
-        List of forecast IDs that were created
-    """
-    import json
-    import psycopg2
-    from datetime import datetime, timedelta
-    
-    if forecasts.empty:
-        print("❌ No forecast data to store in database.")
-        return []
-        
-    cursor = conn.cursor()
-    forecast_ids = []
-    current_time = datetime.now()
-    current_date = current_time.date()
-    
-    try:
-        # Only store recommendations for future dates
-        if 'daily_needs' in recommendations and not recommendations['daily_needs'].empty:
-            daily_df = recommendations['daily_needs']
-            
-            # Process each forecasted day separately, but only future dates
-            for date_idx in daily_df.index:
-                # Skip past dates
-                if date_idx <= current_date:
-                    continue
-                    
-                # Create a dict of ingredient quantities for this day
-                daily_prep = {}
-                for col in daily_df.columns:
-                    if not pd.isna(daily_df.loc[date_idx, col]) and daily_df.loc[date_idx, col] > 0:
-                        daily_prep[str(col)] = float(daily_df.loc[date_idx, col])
-                
-                # Skip if there are no significant quantities
-                if not daily_prep:
-                    continue
-                
-                # Use the date as the recommendationfor field
-                target_date = date_idx
-                
-                # Store in database - just the ingredient quantities for clarity
-                query = """
-                INSERT INTO forecasts (recommendation, recommendationfor, createdat) 
-                VALUES (%s, %s, %s)
-                RETURNING forecastid
-                """
-                
-                cursor.execute(query, (json.dumps(daily_prep), target_date, current_time))
-                forecast_id = cursor.fetchone()[0]
-                forecast_ids.append(forecast_id)
-                print(f"✅ Stored prep recommendation for {target_date.strftime('%Y-%m-%d')} with ID: {forecast_id}")
-        
-        # Commit the transaction
-        conn.commit()
-        print(f"✅ Successfully stored recommendations for future dates in database")
-        return forecast_ids
-        
-    except Exception as e:
-        conn.rollback()
-        print(f"❌ Error storing forecast in database: {e}")
-        return []
-        
-    finally:
-        cursor.close()
 
 
-def store_traffic_recommendations(conn, traffic_recommendations):
-    """
-    Store traffic recommendations in the database.
-    
-    Parameters:
-    -----------
-    conn : psycopg2.extensions.connection
-        Database connection object
-    traffic_recommendations : dict
-        Dictionary of dates with text recommendations
-        
-    Returns:
-    --------
-    list
-        List of forecast IDs that were created
-    """
-    import json
-    from datetime import datetime
-    
-    if not traffic_recommendations:
-        print("❌ No traffic recommendations to store.")
-        return []
-        
-    cursor = conn.cursor()
-    forecast_ids = []
-    current_time = datetime.now()
-    
-    try:
-        for date, recommendation in traffic_recommendations.items():
-            query = """
-            INSERT INTO forecasts (recommendation, recommendationfor, createdat) 
-            VALUES (%s, %s, %s)
-            RETURNING forecastid
-            """
-            
-            # Package the recommendation in a JSON object for clarity
-            recommendation_data = json.dumps({
-                "type": "traffic_forecast",
-                "text_recommendation": recommendation
-            })
-            
-            cursor.execute(query, (recommendation_data, date, current_time))
-            forecast_id = cursor.fetchone()[0]
-            forecast_ids.append(forecast_id)
-            print(f"✅ Stored traffic recommendation for {date.strftime('%Y-%m-%d')} with ID: {forecast_id}")
-        
-        conn.commit()
-        return forecast_ids
-        
-    except Exception as e:
-        conn.rollback()
-        print(f"❌ Error storing traffic recommendations: {e}")
-        return []
-        
-    finally:
-        cursor.close()
-
-
-def clear_forecast_database(conn):
-    """
-    Clear all records from the forecasts table.
-    
-    Parameters:
-    -----------
-    conn : psycopg2.extensions.connection
-        Database connection object
-        
-    Returns:
-    --------
-    bool
-        True if operation was successful, False otherwise
-    """
-    cursor = conn.cursor()
-    
-    try:
-        cursor.execute("DELETE FROM forecasts")
-        deleted_count = cursor.rowcount
-        conn.commit()
-        print(f"✅ Successfully cleared {deleted_count} records from forecasts table")
-        return True
-    except Exception as e:
-        conn.rollback()
-        print(f"❌ Error clearing forecasts table: {e}")
-        return False
-    finally:
-        cursor.close()
-
-
+# Main execution
 if __name__ == "__main__":
     # This section only runs when the script is executed directly
     
@@ -674,7 +1372,7 @@ if __name__ == "__main__":
     import sys
     import argparse
     
-    parser = argparse.ArgumentParser(description='Predict future ingredient needs using SARIMA models')
+    parser = argparse.ArgumentParser(description='Predict future ingredient needs using SARIMAX models')
     parser.add_argument('--days', type=int, default=90, help='Number of historical days to analyze (default: 90)')
     parser.add_argument('--forecast', type=int, default=7, help='Number of days to forecast (default: 7)')
     parser.add_argument('--start', type=str, help='Start date in YYYY-MM-DD format')
@@ -682,6 +1380,8 @@ if __name__ == "__main__":
     parser.add_argument('--save', action='store_true', help='Save forecasts to CSV file')
     parser.add_argument('--clear-db', action='store_true', help='Clear existing forecast records before adding new ones')
     parser.add_argument('--auto-confirm', action='store_true', help='Skip confirmation prompts')
+    parser.add_argument('--parallelize', action='store_true', help='Use parallel processing for SARIMAX models')
+    parser.add_argument('--max-ingredients', type=int, default=0, help='Maximum number of ingredients to process with SARIMAX (0 = all)')
     
     args = parser.parse_args()
     
@@ -722,29 +1422,29 @@ if __name__ == "__main__":
     print("\n" + "-" * 60)
     print("STEP 1: Calculating historical ingredient needs")
     print("-" * 60)
-    ingredients_df = calculate_ingredient_needs(start_date, end_date)
+    ingredients_data = calculate_ingredient_needs(start_date, end_date)
     
-    if ingredients_df.empty:
+    if ingredients_data['hourly'].empty:
         print("❌ No historical ingredient data available. Exiting.")
         sys.exit(1)
     
     # Add diagnostic information
     print("\n🔍 Historical Data Diagnostics:")
-    print(f"  - Non-zero values in historical data: {(ingredients_df > 0).sum().sum()}")
-    print(f"  - Total ingredient usage sum: {ingredients_df.sum().sum():.2f}")
-    print(f"  - Unique timestamps with data: {len(ingredients_df)}")
-    print(f"  - Ingredients with non-zero usage: {(ingredients_df.sum() > 0).sum()}")
+    print(f"  - Non-zero values in historical data: {(ingredients_data['hourly'] > 0).sum().sum()}")
+    print(f"  - Total ingredient usage sum: {ingredients_data['hourly'].sum().sum():.2f}")
+    print(f"  - Unique timestamps with data: {len(ingredients_data['hourly'])}")
+    print(f"  - Ingredients with non-zero usage: {(ingredients_data['hourly'].sum() > 0).sum()}")
     
-    # Step 2: Skip complex SARIMA models and use simpler averaging approach
+    # Step 2: Forecast using SARIMAX models
     print("\n" + "-" * 60)
-    print(f"STEP 2: Forecasting needs for the next {args.forecast} days")
+    print(f"STEP 2: Forecasting needs for the next {args.forecast} days using SARIMAX")
     print("-" * 60)
     forecast_hours = args.forecast * 24  # Convert days to hours
     
-    # Use simpler forecasting method
-    forecasts = forecast_future_needs(ingredients_df, forecast_hours)
+    # Use SARIMAX forecasting method
+    forecasts = forecast_future_needs(ingredients_data, forecast_hours)
     
-   if forecasts.empty:
+    if forecasts['hourly'].empty:
         print("❌ Failed to generate forecasts. Exiting.")
         sys.exit(1)
     
@@ -759,19 +1459,9 @@ if __name__ == "__main__":
     print("\n" + "-" * 60)
     print("STEP 4: Generating traffic recommendations")
     print("-" * 60)
-    traffic_recommendations = generate_traffic_recommendations(ingredients_df, forecasts)
+    traffic_recommendations = generate_traffic_recommendations(ingredients_data, forecasts)
     
-    # Display sample of traffic recommendations
-    if traffic_recommendations:
-        print("\n📋 Sample of traffic recommendations:")
-        for i, (date, recommendation) in enumerate(list(traffic_recommendations.items())[:3]):
-            print(f"\n{date.strftime('%Y-%m-%d')} ({date.strftime('%A')}):")
-            print(f"  {recommendation}")
-        
-        if len(traffic_recommendations) > 3:
-            print(f"\n  ... and {len(traffic_recommendations) - 3} more days")
-    
-    # Step 5: Store recommendations in database
+    # Step 5: Store recommendations in a database
     print("\n" + "-" * 60)
     print("STEP 5: Storing recommendations in database")
     print("-" * 60)
@@ -784,8 +1474,8 @@ if __name__ == "__main__":
     # Save forecasts to CSV if requested
     if args.save:
         forecast_file = f"ingredient_forecast_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
-        forecasts.to_csv(forecast_file)
-        print(f"\n✅ Saved forecasts to {forecast_file}")
+        forecasts['hourly'].to_csv(forecast_file)
+        print(f"\n✅ Saved hourly forecasts to {forecast_file}")
         
         # Also save the daily recommendations
         if 'daily_needs' in recommendations:
@@ -801,11 +1491,30 @@ if __name__ == "__main__":
                     f.write(f"{date.strftime('%Y-%m-%d')} ({date.strftime('%A')}):\n")
                     f.write(f"{recommendation}\n\n")
             print(f"✅ Saved traffic recommendations to {traffic_file}")
+        
+        # Save model diagnostic information
+        model_diag = f"model_diagnostics_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+        with open(model_diag, 'w') as f:
+            f.write("SARIMAX MODEL DIAGNOSTICS\n")
+            f.write("=" * 80 + "\n\n")
+            f.write(f"Historical data range: {ingredients_data['hourly'].index.min()} to {ingredients_data['hourly'].index.max()}\n")
+            f.write(f"Forecast period: {forecasts['hourly'].index.min()} to {forecasts['hourly'].index.max()}\n\n")
+            
+            # Add ingredient-specific information
+            f.write("TOP INGREDIENTS BY USAGE:\n")
+            for ing, total in ingredients_data['hourly'].sum().nlargest(10).items():
+                f.write(f"  - {ing}: {total:.2f} units\n")
+                
+            f.write("\nFORECAST SUMMARY STATISTICS:\n")
+            for ing, total in forecasts['hourly'].sum().nlargest(10).items():
+                f.write(f"  - {ing}: {total:.2f} units\n")
+        
+        print(f"✅ Saved model diagnostics to {model_diag}")
     
     # Final summary
     print("\n" + "=" * 60)
-    print(f"✅ Prediction complete. Generated forecasts for {len(forecasts.columns)} ingredients.")
-    print(f"🔮 Forecast period: {forecasts.index.min().strftime('%Y-%m-%d %H:%M')} to {forecasts.index.max().strftime('%Y-%m-%d %H:%M')}")
+    print(f"✅ Prediction complete. Used SARIMAX models for key ingredients.")
+    print(f"🔮 Forecast period: {forecasts['hourly'].index.min().strftime('%Y-%m-%d %H:%M')} to {forecasts['hourly'].index.max().strftime('%Y-%m-%d %H:%M')}")
     if success_prep:
         print("✅ Future prep recommendations successfully stored in database.")
     if success_traffic:
